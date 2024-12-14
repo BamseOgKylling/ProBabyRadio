@@ -6,6 +6,22 @@ const {
   AudioPlayerStatus,
   VoiceConnectionStatus,
 } = require("@discordjs/voice");
+const { opus } = require("@discordjs/voice");
+
+try {
+  require("@discordjs/opus");
+  console.log("@discordjs/opus loaded successfully.");
+} catch {
+  console.warn("@discordjs/opus not found, falling back to opusscript.");
+  try {
+    require("opusscript");
+    console.log("Using opusscript as a fallback.");
+  } catch (error) {
+    console.error(
+      "Neither @discordjs/opus nor opusscript could be loaded. Audio features might not work properly."
+    );
+  }
+}
 const ytdl = require("ytdl-core");
 
 const client = new Client({
@@ -23,6 +39,7 @@ const TOKEN = process.env.TOKEN;
 const radioStations = {
   gaming: "https://gaming.stream.laut.fm/gaming",
   rock: "http://stream.piraterock.se:8101/webradio",
+  lofi: "https://lofi.stream.laut.fm/lofi",
 };
 
 let player; // Audio player variable to control playback
