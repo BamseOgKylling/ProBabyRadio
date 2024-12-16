@@ -41,6 +41,8 @@ const radioStations = {
   rock: "http://stream.piraterock.se:8101/webradio",
   lofi: "https://lofi.stream.laut.fm/lofi",
   relax: "http://stream.soundstorm-radio.com/radio/8000/radio.mp3",
+  chill:
+    "https://strw3.openstream.co/1292?aw_0_1st.collectionid%3D4384%26stationId%3D4384%26publisherId%3D1316%26k%3D1734375662",
 };
 
 let player; // Audio player variable to control playback
