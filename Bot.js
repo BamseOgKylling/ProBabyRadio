@@ -40,6 +40,7 @@ const radioStations = {
   gaming: "https://gaming.stream.laut.fm/gaming",
   rock: "http://stream.piraterock.se:8101/webradio",
   lofi: "https://lofi.stream.laut.fm/lofi",
+  relax: "https://transliacija.relaxfm.lt/relaxfm128.mp3",
 };
 
 let player; // Audio player variable to control playback
