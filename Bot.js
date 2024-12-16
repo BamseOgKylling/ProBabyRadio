@@ -44,6 +44,7 @@ const radioStations = {
 
 let player; // Audio player variable to control playback
 let connection; // Voice connection variable
+let idleTimer; // Timer to track idle time
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}!`);
@@ -80,6 +81,7 @@ client.on("messageCreate", async (message) => {
         connection.subscribe(player);
 
         message.reply(`Now playing the ${stationName} station!`);
+        startIdleTimer(message); // Start the idle timer when a station is playing
       } else if (!stationName) {
         message.reply(
           `Please specify a station like "!Play gaming". Available stations: ${Object.keys(
@@ -122,4 +124,32 @@ client.on("messageCreate", async (message) => {
   }
 });
 
+// Function to start or reset the idle timer
+function startIdleTimer() {
+  if (idleTimer) clearTimeout(idleTimer); // Clear any existing timer
+
+  // Set a new timer to check channel activity after 3 minutes
+  idleTimer = setTimeout(() => {
+    checkVoiceChannelActivity();
+  }, 3 * 60 * 1000); // 3 minutes
+}
+
+// Function to check if the bot should disconnect due to inactivity
+async function checkVoiceChannelActivity() {
+  if (connection) {
+    const channel = connection.joinConfig.channelId;
+    const voiceChannel = client.channels.cache.get(channel);
+
+    if (voiceChannel && voiceChannel.members.size <= 1) {
+      // Disconnect if the bot is alone in the channel
+      connection.destroy();
+      connection = null;
+      player = null;
+      console.log("Disconnected due to inactivity.");
+    } else {
+      // Restart the timer if there are still members in the channel
+      startIdleTimer();
+    }
+  }
+}
 client.login(TOKEN);
