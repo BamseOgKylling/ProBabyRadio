@@ -1,4 +1,5 @@
 Discord Bot with Radio options for me and my friends while we sit and do whatever we do .
+Dont forget to change the .env and use the acual Api key you get from discord dev portal bot app.
 API comes form Discord Dev portal.
 Using render for keeping it online (when its online) / works fine if you keep it on locally on you computer aswell aslong as your computer is on and the project is on.
 
