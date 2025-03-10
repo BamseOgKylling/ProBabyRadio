@@ -1,12 +1,7 @@
 const { Client, GatewayIntentBits } = require("discord.js");
-const {
-  joinVoiceChannel,
-  createAudioPlayer,
-  createAudioResource,
-} = require("@discordjs/voice");
-const axios = require("axios");
-
+const { fetchRadioStations, playStation } = require("./probabyradio"); // Import functions
 require("dotenv").config();
+
 const TOKEN = process.env.TOKEN;
 
 const client = new Client({
@@ -23,26 +18,6 @@ const connections = new Map();
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}!`);
 });
-
-// Fetch stations from the Radio-Browser API
-async function fetchRadioStations(query) {
-  try {
-    const response = await axios.get(
-      `https://de1.api.radio-browser.info/json/stations/byname/${encodeURIComponent(
-        query
-      )}`
-    );
-
-    if (response.data.length === 0) return null;
-    return response.data.slice(0, 5).map((station) => ({
-      name: station.name,
-      url: station.url,
-    }));
-  } catch (error) {
-    console.error("Error fetching radio stations:", error);
-    return null;
-  }
-}
 
 // Handle commands
 client.on("messageCreate", async (message) => {
@@ -102,19 +77,11 @@ client.on("messageCreate", async (message) => {
     }
 
     const station = guildData.stations[stationIndex];
-
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-    });
-
-    const player = createAudioPlayer();
-    const resource = createAudioResource(station.url, { inlineVolume: true });
-    resource.volume.setVolume(0.1);
-
-    player.play(resource);
-    connection.subscribe(player);
+    const { connection, player } = await playStation(
+      message,
+      station,
+      voiceChannel
+    );
 
     connections.set(message.guild.id, { connection, player });
     message.reply(`Now playing: **${station.name}** 🎵`);
