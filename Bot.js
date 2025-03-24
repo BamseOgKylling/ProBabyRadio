@@ -26,22 +26,32 @@ client.once("ready", () => {
 
 // Fetch stations from the Radio-Browser API
 async function fetchRadioStations(query) {
-  try {
-    const response = await axios.get(
-      `https://de1.api.radio-browser.info/json/stations/byname/${encodeURIComponent(
-        query
-      )}`
-    );
+  const apiServers = [
+    "https://de1.api.radio-browser.info",
+    "https://nl1.api.radio-browser.info",
+    "https://at1.api.radio-browser.info",
+    "https://fr1.api.radio-browser.info",
+  ];
 
-    if (response.data.length === 0) return null;
-    return response.data.slice(0, 5).map((station) => ({
-      name: station.name,
-      url: station.url,
-    }));
-  } catch (error) {
-    console.error("Error fetching radio stations:", error);
-    return null;
+  for (const server of apiServers) {
+    try {
+      const response = await axios.get(
+        `${server}/json/stations/byname/${encodeURIComponent(query)}`
+      );
+
+      if (response.data.length > 0) {
+        return response.data.slice(0, 5).map((station) => ({
+          name: station.name,
+          url: station.url,
+        }));
+      }
+    } catch (error) {
+      console.error(`Error with ${server}:`, error.message);
+    }
   }
+
+  console.error("All API servers failed.");
+  return null;
 }
 
 // Handle commands
