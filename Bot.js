@@ -36,7 +36,8 @@ async function fetchRadioStations(query) {
   for (const server of apiServers) {
     try {
       const response = await axios.get(
-        `${server}/json/stations/byname/${encodeURIComponent(query)}`
+        `${server}/json/stations/byname/${encodeURIComponent(query)}`,
+        { timeout: 5000 } // timout 5 seconds incase if servers are down
       );
 
       if (response.data.length > 0) {
