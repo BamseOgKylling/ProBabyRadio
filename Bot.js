@@ -19,6 +19,37 @@ client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}!`);
 });
 
+// Fetch stations from the Radio-Browser API
+async function fetchRadioStations(query) {
+  const apiServers = [
+    "https://de1.api.radio-browser.info",
+    "https://nl1.api.radio-browser.info",
+    "https://at1.api.radio-browser.info",
+    "https://fr1.api.radio-browser.info",
+  ];
+
+  for (const server of apiServers) {
+    try {
+      const response = await axios.get(
+        `${server}/json/stations/byname/${encodeURIComponent(query)}`,
+        { timeout: 2000 } // timout 2 seconds incase if servers are down
+      );
+
+      if (response.data.length > 0) {
+        return response.data.slice(0, 5).map((station) => ({
+          name: station.name,
+          url: station.url,
+        }));
+      }
+    } catch (error) {
+      console.error(`Error with ${server}:`, error.message);
+    }
+  }
+
+  console.error("All API servers failed.");
+  return null;
+}
+
 // Handle commands
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
