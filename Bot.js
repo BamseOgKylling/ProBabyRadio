@@ -1,4 +1,5 @@
 const { Client, GatewayIntentBits } = require("discord.js");
+const { getRandomizedRadioServers } = require("./radioResolver");
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -26,12 +27,12 @@ client.once("ready", () => {
 
 // Fetch stations from the Radio-Browser API
 async function fetchRadioStations(query) {
-  const apiServers = [
-    "https://de1.api.radio-browser.info",
-    "https://nl1.api.radio-browser.info",
-    "https://at1.api.radio-browser.info",
-    "https://fr1.api.radio-browser.info",
-  ];
+  const apiServers = await getRandomizedRadioServers();
+
+  if (!apiServers.length) {
+    console.error("No Radio Browser servers available.");
+    return null;
+  }
 
   for (const server of apiServers) {
     try {
