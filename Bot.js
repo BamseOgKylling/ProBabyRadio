@@ -4,7 +4,11 @@ const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
+  StreamType,
+  entersState,
+  VoiceConnectionStatus,
 } = require("@discordjs/voice");
+const ytdl = require("@distube/ytdl-core");
 const axios = require("axios");
 
 require("dotenv").config();
@@ -18,6 +22,40 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
   ],
 });
+
+const SpotifyWebApi = require("spotify-web-api-node");
+
+const spotifyApi = new SpotifyWebApi({
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+});
+
+async function getSpotifyTrackUrls(spotifyUrl) {
+  try {
+    const tokenData = await spotifyApi.clientCredentialsGrant();
+    spotifyApi.setAccessToken(tokenData.body["access_token"]);
+
+    if (spotifyUrl.includes("track")) {
+      const trackId = spotifyUrl.split("/track/")[1].split("?")[0];
+      const track = await spotifyApi.getTrack(trackId);
+      return [`${track.body.name} ${track.body.artists[0].name}`];
+    }
+
+    if (spotifyUrl.includes("playlist")) {
+      const playlistId = spotifyUrl.split("/playlist/")[1].split("?")[0];
+      const data = await spotifyApi.getPlaylistTracks(playlistId);
+      return data.body.items.map((item) => {
+        const track = item.track;
+        return `${track.name} ${track.artists[0].name}`;
+      });
+    }
+
+    return [];
+  } catch (err) {
+    console.error("Spotify error:", err.message);
+    return [];
+  }
+}
 
 const connections = new Map();
 
@@ -61,6 +99,136 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
 
   const voiceChannel = message.member.voice.channel;
+
+  ///
+  if (message.content.startsWith("!playurl")) {
+    if (!voiceChannel) {
+      return message.reply("Join a voice channel first!");
+    }
+
+    const url = message.content.split(" ")[1];
+    if (!url) return message.reply("Please provide a URL.");
+
+    // YouTube playback using ytdl-core from your working code
+    if (url.includes("youtube.com") || url.includes("youtu.be")) {
+      if (!ytdl.validateURL(url)) {
+        return message.reply("Invalid YouTube URL.");
+      }
+
+      try {
+        // Join the voice channel
+        const connection = joinVoiceChannel({
+          channelId: voiceChannel.id,
+          guildId: message.guild.id,
+          adapterCreator: message.guild.voiceAdapterCreator,
+        });
+
+        // Wait until the connection is ready
+        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+        // Create audio player
+        const player = createAudioPlayer();
+
+        // Stream audio from YouTube (audio only)
+        const stream = ytdl(url, {
+          filter: "audioonly",
+          quality: "highestaudio",
+          highWaterMark: 1 << 25,
+        });
+
+        const resource = createAudioResource(stream, {
+          inputType: StreamType.Arbitrary,
+          inlineVolume: true,
+        });
+
+        resource.volume.setVolume(0.1);
+
+        // Subscribe the connection to the player
+        connection.subscribe(player);
+
+        // Play the audio resource
+        player.play(resource);
+
+        // Save connection for cleanup, etc.
+        connections.set(message.guild.id, { connection, player });
+
+        message.reply(`▶️ Now playing audio from: ${url}`);
+
+        // Handle player events
+        player.on("idle", () => {
+          connection.destroy();
+          connections.delete(message.guild.id);
+        });
+
+        player.on("error", (error) => {
+          console.error("Audio player error:", error);
+          message.channel.send("⚠️ Error while playing audio.");
+          connection.destroy();
+          connections.delete(message.guild.id);
+        });
+      } catch (error) {
+        console.error("🚨 Error while trying to play audio:", error);
+        message.reply("⚠️ Failed to play the audio.");
+      }
+    } else if (url.includes("spotify.com")) {
+      // Spotify playback logic stays same (search YouTube via yt-search)
+      const searchQueries = await getSpotifyTrackUrls(url);
+      if (searchQueries.length === 0) {
+        return message.reply("Could not retrieve tracks from Spotify.");
+      }
+
+      const query = searchQueries[0];
+      const ytSearch = require("yt-search");
+      const result = await ytSearch(query);
+      const video = result.videos.length ? result.videos[0] : null;
+      if (!video) return message.reply("Couldn't find the track on YouTube.");
+
+      // Recursively call the YouTube playback with the found URL
+      message.content = `!playurl ${video.url}`;
+      client.emit("messageCreate", message);
+    } else if (url.startsWith("http://") || url.startsWith("https://")) {
+      // Direct radio stream
+      if (!voiceChannel) {
+        return message.reply("Join a voice channel first!");
+      }
+
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+
+      try {
+        const resource = createAudioResource(url, { inlineVolume: true });
+        resource.volume.setVolume(0.1);
+
+        const player = createAudioPlayer();
+        player.play(resource);
+        connection.subscribe(player);
+
+        connections.set(message.guild.id, { connection, player });
+
+        message.reply(`Now playing radio stream: ${url}`);
+
+        player.on("error", (error) => {
+          console.error("Audio player error:", error);
+          message.channel.send("An error occurred while playing the audio.");
+        });
+
+        player.on("idle", () => {
+          connection.destroy();
+          connections.delete(message.guild.id);
+        });
+      } catch (error) {
+        console.error("Error playing radio stream:", error);
+        message.reply("Failed to play the provided radio stream URL.");
+      }
+    } else {
+      return message.reply(
+        "Only YouTube, Spotify and direct radio stream URLs are supported."
+      );
+    }
+  }
 
   if (message.content.startsWith("!search")) {
     const args = message.content.split(" ").slice(1);
