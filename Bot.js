@@ -56,7 +56,7 @@ async function getSpotifyTrackUrls(spotifyUrl) {
     return [];
   }
 }
-
+const queues = new Map();
 const connections = new Map();
 
 client.once("ready", () => {
@@ -109,6 +109,22 @@ client.on("messageCreate", async (message) => {
     const url = message.content.split(" ")[1];
     if (!url) return message.reply("Please provide a URL.");
 
+    // STOP current playback and clear old connections/queue
+    const existing = connections.get(message.guild.id);
+    if (existing && existing.connection && !existing.connection.destroyed) {
+      try {
+        existing.player.stop();
+        existing.connection.destroy();
+      } catch (err) {
+        console.warn("Failed to stop or destroy old connection:", err);
+      }
+      connections.delete(message.guild.id);
+    }
+
+    if (queues.has(message.guild.id)) {
+      queues.delete(message.guild.id);
+    }
+
     // YouTube playback using ytdl-core from your working code
     if (url.includes("youtube.com") || url.includes("youtu.be")) {
       if (!ytdl.validateURL(url)) {
@@ -134,6 +150,16 @@ client.on("messageCreate", async (message) => {
           filter: "audioonly",
           quality: "highestaudio",
           highWaterMark: 1 << 25,
+          requestOptions: {
+            headers: {
+              // This helps avoid being blocked by YouTube
+              "User-Agent":
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/92.0.4515.159 Safari/537.36",
+              Referer: "https://www.youtube.com/",
+            },
+          },
         });
 
         const resource = createAudioResource(stream, {
@@ -156,36 +182,81 @@ client.on("messageCreate", async (message) => {
 
         // Handle player events
         player.on("idle", () => {
-          connection.destroy();
+          const connData = connections.get(message.guild.id);
+          if (
+            connData &&
+            connData.connection &&
+            !connData.connection.destroyed
+          ) {
+            connData.connection.destroy();
+          }
           connections.delete(message.guild.id);
-        });
 
-        player.on("error", (error) => {
-          console.error("Audio player error:", error);
-          message.channel.send("⚠️ Error while playing audio.");
-          connection.destroy();
-          connections.delete(message.guild.id);
+          const currentQueue = queues.get(message.guild.id);
+          if (currentQueue && currentQueue.length > 0) {
+            playQueue(currentQueue, voiceChannel, message);
+          } else {
+            queues.delete(message.guild.id);
+          }
         });
       } catch (error) {
         console.error("🚨 Error while trying to play audio:", error);
         message.reply("⚠️ Failed to play the audio.");
       }
     } else if (url.includes("spotify.com")) {
-      // Spotify playback logic stays same (search YouTube via yt-search)
       const searchQueries = await getSpotifyTrackUrls(url);
       if (searchQueries.length === 0) {
         return message.reply("Could not retrieve tracks from Spotify.");
       }
 
-      const query = searchQueries[0];
-      const ytSearch = require("yt-search");
-      const result = await ytSearch(query);
-      const video = result.videos.length ? result.videos[0] : null;
-      if (!video) return message.reply("Couldn't find the track on YouTube.");
+      message.reply(
+        `🔁 Loaded ${searchQueries.length} tracks from Spotify playlist.`
+      );
 
-      // Recursively call the YouTube playback with the found URL
-      message.content = `!playurl ${video.url}`;
-      client.emit("messageCreate", message);
+      const ytSearch = require("yt-search");
+
+      const [firstQuery, ...restQueries] = searchQueries;
+
+      // Search for and play the first track
+      const firstResult = await ytSearch(firstQuery);
+      const firstVideo = firstResult.videos.length
+        ? firstResult.videos[0]
+        : null;
+
+      if (!firstVideo) {
+        return message.reply("Couldn't find the first track on YouTube.");
+      }
+
+      message.reply(
+        `▶️ Now playing first track from Spotify: **${firstVideo.title}**`
+      );
+
+      playQueue([firstVideo.url], voiceChannel, message); // Start with just the first song
+
+      // Start resolving the rest in the background
+      (async () => {
+        const restUrls = [];
+
+        for (const query of restQueries) {
+          try {
+            const result = await ytSearch(query);
+            const video = result.videos.length ? result.videos[0] : null;
+            if (video) {
+              restUrls.push(video.url);
+            }
+          } catch (e) {
+            console.warn("Error searching YouTube for:", query, e);
+          }
+        }
+
+        if (!queues.has(message.guild.id)) {
+          queues.set(message.guild.id, []);
+        }
+
+        const currentQueue = queues.get(message.guild.id);
+        currentQueue.push(...restUrls);
+      })();
+      //
     } else if (url.startsWith("http://") || url.startsWith("https://")) {
       // Direct radio stream
       if (!voiceChannel) {
@@ -313,6 +384,24 @@ client.on("messageCreate", async (message) => {
       message.reply("Nothing is currently playing.");
     }
   }
+
+  if (message.content === "!skip") {
+    const guildId = message.guild.id;
+    const connectionData = connections.get(guildId);
+
+    if (!connectionData) {
+      return message.reply("There is no song playing right now.");
+    }
+
+    const { player, connection } = connectionData;
+
+    if (!player) {
+      return message.reply("No audio is currently playing.");
+    }
+
+    message.reply("⏭ Skipping current track...");
+    player.stop(); // This triggers the 'idle' event, which plays the next track if any.
+  }
 });
 
 // Handle voice state updates (detect when users leave)
@@ -368,5 +457,72 @@ function checkVoiceChannelActivity(guildId) {
         console.log(`Disconnected from ${guildId} due to inactivity.`);
       }
     }, 2 * 60 * 1000); // Wait 2 minutes before leaving
+  }
+}
+// Modify playQueue function to store the queue:
+async function playQueue(queue, voiceChannel, message) {
+  if (!queue.length) return;
+
+  // Store the queue for this guild
+  queues.set(message.guild.id, queue);
+
+  const url = queue.shift();
+
+  try {
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: message.guild.id,
+      adapterCreator: message.guild.voiceAdapterCreator,
+    });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+    const stream = ytdl(url, {
+      filter: "audioonly",
+      quality: "highestaudio",
+      highWaterMark: 1 << 25,
+    });
+
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: true,
+    });
+
+    resource.volume.setVolume(0.1);
+
+    const player = createAudioPlayer();
+    connection.subscribe(player);
+    player.play(resource);
+
+    connections.set(message.guild.id, { connection, player });
+
+    message.channel.send(`▶️ Now playing: ${url}`);
+
+    player.on("idle", () => {
+      connection.destroy();
+      connections.delete(message.guild.id);
+      const currentQueue = queues.get(message.guild.id);
+      if (currentQueue && currentQueue.length > 0) {
+        playQueue(currentQueue, voiceChannel, message);
+      } else {
+        queues.delete(message.guild.id);
+      }
+    });
+
+    player.on("error", (error) => {
+      console.error("Audio player error:", error);
+      message.channel.send("⚠️ Error while playing a track. Skipping...");
+      connection.destroy();
+      connections.delete(message.guild.id);
+      const currentQueue = queues.get(message.guild.id);
+      if (currentQueue && currentQueue.length > 0) {
+        playQueue(currentQueue, voiceChannel, message);
+      } else {
+        queues.delete(message.guild.id);
+      }
+    });
+  } catch (error) {
+    console.error("Queue error:", error);
+    message.reply("Something went wrong while trying to play the playlist.");
   }
 }

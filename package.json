@@ -21,7 +21,8 @@
     "opusscript": "^0.0.8",
     "play-dl": "^1.9.7",
     "spotify-web-api-node": "^5.0.2",
-    "yt-search": "^2.13.1"
+    "yt-search": "^2.13.1",
+    "ytdl-core": "^4.11.5"
   },
   "repository": {
     "type": "git",
