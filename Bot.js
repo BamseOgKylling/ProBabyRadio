@@ -10,7 +10,7 @@ const {
 } = require("@discordjs/voice");
 const ytdl = require("@distube/ytdl-core");
 const axios = require("axios");
-
+const yts = require("yt-search");
 require("dotenv").config();
 const TOKEN = process.env.TOKEN;
 
@@ -131,78 +131,127 @@ client.on("messageCreate", async (message) => {
         return message.reply("Invalid YouTube URL.");
       }
 
+      let finalUrl = url;
+
       try {
-        // Join the voice channel
-        const connection = joinVoiceChannel({
-          channelId: voiceChannel.id,
-          guildId: message.guild.id,
-          adapterCreator: message.guild.voiceAdapterCreator,
-        });
+        // First try: get video details
+        const info = await ytdl.getBasicInfo(url);
+        const details = info.videoDetails;
 
-        // Wait until the connection is ready
-        await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-
-        // Create audio player
-        const player = createAudioPlayer();
-
-        // Stream audio from YouTube (audio only)
-        const stream = ytdl(url, {
-          filter: "audioonly",
-          quality: "highestaudio",
-          highWaterMark: 1 << 25,
-          requestOptions: {
-            headers: {
-              // This helps avoid being blocked by YouTube
-              "User-Agent":
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                "Chrome/92.0.4515.159 Safari/537.36",
-              Referer: "https://www.youtube.com/",
-            },
-          },
-        });
-
-        const resource = createAudioResource(stream, {
-          inputType: StreamType.Arbitrary,
-          inlineVolume: true,
-        });
-
-        resource.volume.setVolume(0.1);
-
-        // Subscribe the connection to the player
-        connection.subscribe(player);
-
-        // Play the audio resource
-        player.play(resource);
-
-        // Save connection for cleanup, etc.
-        connections.set(message.guild.id, { connection, player });
-
-        message.reply(`▶️ Now playing audio from: ${url}`);
-
-        // Handle player events
-        player.on("idle", () => {
-          const connData = connections.get(message.guild.id);
-          if (
-            connData &&
-            connData.connection &&
-            !connData.connection.destroyed
-          ) {
-            connData.connection.destroy();
-          }
-          connections.delete(message.guild.id);
-
-          const currentQueue = queues.get(message.guild.id);
-          if (currentQueue && currentQueue.length > 0) {
-            playQueue(currentQueue, voiceChannel, message);
+        if (details.age_restricted || details.isPrivate || details.isUnlisted) {
+          console.warn("Video restricted, trying lyrics fallback...");
+          const search = await yts(`${details.title} lyrics`);
+          if (search && search.videos.length > 0) {
+            finalUrl = search.videos[0].url;
+            message.reply(
+              `Original video restricted. Using lyrics version: ${finalUrl}`
+            );
           } else {
-            queues.delete(message.guild.id);
+            return message.reply(
+              "Could not find a lyrics version for this video."
+            );
           }
-        });
-      } catch (error) {
-        console.error("🚨 Error while trying to play audio:", error);
-        message.reply("⚠️ Failed to play the audio.");
+        }
+      } catch (err) {
+        console.warn(
+          "Failed to fetch video info (likely age restriction):",
+          err
+        );
+
+        try {
+          // Try to extract video ID
+          const idMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&?]|$)/);
+          let query = url;
+
+          if (idMatch) {
+            const videoId = idMatch[1];
+            // yt-search can fetch video info by ID
+            const videoSearch = await yts({ videoId });
+            if (videoSearch && videoSearch.title) {
+              query = videoSearch.title;
+            }
+          }
+
+          // Always append "lyrics" to increase chance of playable video
+          const search = await yts(`${query} lyrics`);
+          if (search && search.videos.length > 0) {
+            finalUrl = search.videos[0].url;
+            message.reply(
+              `Original video blocked. Using lyrics version: ${finalUrl}`
+            );
+          } else {
+            return message.reply(
+              "Could not find a lyrics version for this video."
+            );
+          }
+        } catch (searchErr) {
+          console.warn("Lyrics fallback search also failed:", searchErr);
+          return message.reply(
+            "Could not bypass age restriction for this video."
+          );
+        }
       }
+
+      // Join the voice channel
+      const connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: message.guild.id,
+        adapterCreator: message.guild.voiceAdapterCreator,
+      });
+
+      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+
+      const player = createAudioPlayer();
+
+      // Stream from finalUrl (original or fallback)
+      const stream = ytdl(finalUrl, {
+        filter: "audioonly",
+        quality: "highestaudio",
+        highWaterMark: 1 << 25,
+        requestOptions: {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+              "AppleWebKit/537.36 (KHTML, like Gecko) " +
+              "Chrome/92.0.4515.159 Safari/537.36",
+            Referer: "https://www.youtube.com/",
+          },
+        },
+      });
+
+      const resource = createAudioResource(stream, {
+        inputType: StreamType.Arbitrary,
+        inlineVolume: true,
+      });
+
+      resource.volume.setVolume(0.1);
+
+      // Subscribe the connection to the player
+      connection.subscribe(player);
+
+      // Play the audio resource
+      player.play(resource);
+
+      // Save connection for cleanup, etc.
+      connections.set(message.guild.id, { connection, player });
+
+      message.reply(`▶️ Now playing audio from: ${finalUrl}`);
+
+      // Handle player events
+      player.on("idle", () => {
+        const connData = connections.get(message.guild.id);
+        if (connData && connData.connection && !connData.connection.destroyed) {
+          connData.connection.destroy();
+        }
+        connections.delete(message.guild.id);
+
+        const currentQueue = queues.get(message.guild.id);
+        if (currentQueue && currentQueue.length > 0) {
+          playQueue(currentQueue, voiceChannel, message);
+        } else {
+          queues.delete(message.guild.id);
+        }
+      });
     } else if (url.includes("spotify.com")) {
       const searchQueries = await getSpotifyTrackUrls(url);
       if (searchQueries.length === 0) {
@@ -213,49 +262,56 @@ client.on("messageCreate", async (message) => {
         `🔁 Loaded ${searchQueries.length} tracks from Spotify playlist.`
       );
 
-      const ytSearch = require("yt-search");
-
       const [firstQuery, ...restQueries] = searchQueries;
 
-      // Search for and play the first track
-      const firstResult = await ytSearch(firstQuery);
-      const firstVideo = firstResult.videos.length
-        ? firstResult.videos[0]
-        : null;
+      try {
+        // Search for the first track
+        const firstResult = await yts(firstQuery);
+        const firstVideo = firstResult.videos.length
+          ? firstResult.videos[0]
+          : null;
 
-      if (!firstVideo) {
-        return message.reply("Couldn't find the first track on YouTube.");
-      }
+        if (!firstVideo) {
+          return message.reply("Couldn't find the first track on YouTube.");
+        }
 
-      message.reply(
-        `▶️ Now playing first track from Spotify: **${firstVideo.title}**`
-      );
+        message.reply(
+          `▶️ Now playing first track from Spotify: **${firstVideo.title}**`
+        );
 
-      playQueue([firstVideo.url], voiceChannel, message); // Start with just the first song
+        // Start playback with the first song
+        playQueue([finalUrl], voiceChannel, message);
 
-      // Start resolving the rest in the background
-      (async () => {
-        const restUrls = [];
+        // Resolve the rest of the tracks in the background
+        (async () => {
+          const restUrls = [];
 
-        for (const query of restQueries) {
-          try {
-            const result = await ytSearch(query);
-            const video = result.videos.length ? result.videos[0] : null;
-            if (video) {
-              restUrls.push(video.url);
+          for (const query of restQueries) {
+            try {
+              const result = await yts(query);
+              const video = result.videos.length ? result.videos[0] : null;
+              if (video) {
+                restUrls.push(video.url);
+              }
+            } catch (e) {
+              console.warn("Error searching YouTube for:", query, e);
             }
-          } catch (e) {
-            console.warn("Error searching YouTube for:", query, e);
           }
-        }
 
-        if (!queues.has(message.guild.id)) {
-          queues.set(message.guild.id, []);
-        }
+          // Add results to the queue if the guild still has one
+          if (!queues.has(message.guild.id)) {
+            queues.set(message.guild.id, []);
+          }
 
-        const currentQueue = queues.get(message.guild.id);
-        currentQueue.push(...restUrls);
-      })();
+          const currentQueue = queues.get(message.guild.id);
+          currentQueue.push(...restUrls);
+        })();
+      } catch (error) {
+        console.error("Error handling Spotify playback:", error);
+        return message.reply(
+          "An error occurred while processing the Spotify playlist."
+        );
+      }
       //
     } else if (url.startsWith("http://") || url.startsWith("https://")) {
       // Direct radio stream
