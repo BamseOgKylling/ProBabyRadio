@@ -1,17 +1,25 @@
+console.log(
+  "aes-256-gcm:",
+  require("node:crypto").getCiphers().includes("aes-256-gcm")
+);
+
 const { Client, GatewayIntentBits } = require("discord.js");
-const { getRandomizedRadioServers } = require("./radioResolver");
+const axios = require("axios");
+require("dotenv").config();
+
 const {
   joinVoiceChannel,
   createAudioPlayer,
   createAudioResource,
-  StreamType,
   entersState,
   VoiceConnectionStatus,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  getVoiceConnection,
 } = require("@discordjs/voice");
-const ytdl = require("@distube/ytdl-core");
-const axios = require("axios");
-const yts = require("yt-search");
-require("dotenv").config();
+
+const { getRandomizedRadioServers } = require("./radioResolver");
+
 const TOKEN = process.env.TOKEN;
 
 const client = new Client({
@@ -23,47 +31,20 @@ const client = new Client({
   ],
 });
 
-const SpotifyWebApi = require("spotify-web-api-node");
+// Separera sökresultat från aktiva voice-connections
+const searchResults = new Map(); // guildId -> [{ name, url }]
+const activePlayers = new Map(); // guildId -> { connection, player }
 
-const spotifyApi = new SpotifyWebApi({
-  clientId: process.env.SPOTIFY_CLIENT_ID,
-  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
-});
-
-async function getSpotifyTrackUrls(spotifyUrl) {
-  try {
-    const tokenData = await spotifyApi.clientCredentialsGrant();
-    spotifyApi.setAccessToken(tokenData.body["access_token"]);
-
-    if (spotifyUrl.includes("track")) {
-      const trackId = spotifyUrl.split("/track/")[1].split("?")[0];
-      const track = await spotifyApi.getTrack(trackId);
-      return [`${track.body.name} ${track.body.artists[0].name}`];
-    }
-
-    if (spotifyUrl.includes("playlist")) {
-      const playlistId = spotifyUrl.split("/playlist/")[1].split("?")[0];
-      const data = await spotifyApi.getPlaylistTracks(playlistId);
-      return data.body.items.map((item) => {
-        const track = item.track;
-        return `${track.name} ${track.artists[0].name}`;
-      });
-    }
-
-    return [];
-  } catch (err) {
-    console.error("Spotify error:", err.message);
-    return [];
-  }
-}
-const queues = new Map();
-const connections = new Map();
-
-client.once("ready", () => {
+// =========================
+// READY
+// =========================
+client.once("clientReady", () => {
   console.log(`Logged in as ${client.user.tag}!`);
 });
 
-// Fetch stations from the Radio-Browser API
+// =========================
+// RADIO SEARCH
+// =========================
 async function fetchRadioStations(query) {
   const apiServers = await getRandomizedRadioServers();
 
@@ -76,17 +57,17 @@ async function fetchRadioStations(query) {
     try {
       const response = await axios.get(
         `${server}/json/stations/byname/${encodeURIComponent(query)}`,
-        { timeout: 2000 } // timout 2 seconds incase if servers are down
+        { timeout: 4000 }
       );
 
-      if (response.data.length > 0) {
+      if (Array.isArray(response.data) && response.data.length > 0) {
         return response.data.slice(0, 5).map((station) => ({
-          name: station.name,
-          url: station.url,
+          name: station.name || "Unknown station",
+          url: station.url_resolved || station.url,
         }));
       }
     } catch (error) {
-      console.error(`Error with ${server}:`, error.message);
+      console.error(`Error with ${server}: ${error.message}`);
     }
   }
 
@@ -94,386 +75,249 @@ async function fetchRadioStations(query) {
   return null;
 }
 
-// Handle commands
-client.on("messageCreate", async (message) => {
-  if (message.author.bot) return;
+// =========================
+// STOP / CLEANUP
+// =========================
+function stopPlayback(guildId) {
+  const existing = activePlayers.get(guildId);
+  if (!existing) return;
 
-  const voiceChannel = message.member.voice.channel;
-
-  ///
-  if (message.content.startsWith("!playurl")) {
-    if (!voiceChannel) {
-      return message.reply("Join a voice channel first!");
-    }
-
-    const url = message.content.split(" ")[1];
-    if (!url) return message.reply("Please provide a URL.");
-
-    // STOP current playback and clear old connections/queue
-    const existing = connections.get(message.guild.id);
-    if (existing && existing.connection && !existing.connection.destroyed) {
-      try {
-        existing.player.stop();
-        existing.connection.destroy();
-      } catch (err) {
-        console.warn("Failed to stop or destroy old connection:", err);
-      }
-      connections.delete(message.guild.id);
-    }
-
-    if (queues.has(message.guild.id)) {
-      queues.delete(message.guild.id);
-    }
-
-    // YouTube playback using ytdl-core from your working code
-    if (url.includes("youtube.com") || url.includes("youtu.be")) {
-      if (!ytdl.validateURL(url)) {
-        return message.reply("Invalid YouTube URL.");
-      }
-
-      let finalUrl = url;
-
-      try {
-        // First try: get video details
-        const info = await ytdl.getBasicInfo(url);
-        const details = info.videoDetails;
-
-        if (details.age_restricted || details.isPrivate || details.isUnlisted) {
-          console.warn("Video restricted, trying lyrics fallback...");
-          const search = await yts(`${details.title} lyrics`);
-          if (search && search.videos.length > 0) {
-            finalUrl = search.videos[0].url;
-            message.reply(
-              `Original video restricted. Using lyrics version: ${finalUrl}`
-            );
-          } else {
-            return message.reply(
-              "Could not find a lyrics version for this video."
-            );
-          }
-        }
-      } catch (err) {
-        console.warn(
-          "Failed to fetch video info (likely age restriction):",
-          err
-        );
-
-        try {
-          // Try to extract video ID
-          const idMatch = url.match(/(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&?]|$)/);
-          let query = url;
-
-          if (idMatch) {
-            const videoId = idMatch[1];
-            // yt-search can fetch video info by ID
-            const videoSearch = await yts({ videoId });
-            if (videoSearch && videoSearch.title) {
-              query = videoSearch.title;
-            }
-          }
-
-          // Always append "lyrics" to increase chance of playable video
-          const search = await yts(`${query} lyrics`);
-          if (search && search.videos.length > 0) {
-            finalUrl = search.videos[0].url;
-            message.reply(
-              `Original video blocked. Using lyrics version: ${finalUrl}`
-            );
-          } else {
-            return message.reply(
-              "Could not find a lyrics version for this video."
-            );
-          }
-        } catch (searchErr) {
-          console.warn("Lyrics fallback search also failed:", searchErr);
-          return message.reply(
-            "Could not bypass age restriction for this video."
-          );
-        }
-      }
-
-      // Join the voice channel
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
-
-      await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-
-      const player = createAudioPlayer();
-
-      // Stream from finalUrl (original or fallback)
-      const stream = ytdl(finalUrl, {
-        filter: "audioonly",
-        quality: "highestaudio",
-        highWaterMark: 1 << 25,
-        requestOptions: {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-              "AppleWebKit/537.36 (KHTML, like Gecko) " +
-              "Chrome/92.0.4515.159 Safari/537.36",
-            Referer: "https://www.youtube.com/",
-          },
-        },
-      });
-
-      const resource = createAudioResource(stream, {
-        inputType: StreamType.Arbitrary,
-        inlineVolume: true,
-      });
-
-      resource.volume.setVolume(0.1);
-
-      // Subscribe the connection to the player
-      connection.subscribe(player);
-
-      // Play the audio resource
-      player.play(resource);
-
-      // Save connection for cleanup, etc.
-      connections.set(message.guild.id, { connection, player });
-
-      message.reply(`▶️ Now playing audio from: ${finalUrl}`);
-
-      // Handle player events
-      player.on("idle", () => {
-        const connData = connections.get(message.guild.id);
-        if (connData && connData.connection && !connData.connection.destroyed) {
-          connData.connection.destroy();
-        }
-        connections.delete(message.guild.id);
-
-        const currentQueue = queues.get(message.guild.id);
-        if (currentQueue && currentQueue.length > 0) {
-          playQueue(currentQueue, voiceChannel, message);
-        } else {
-          queues.delete(message.guild.id);
-        }
-      });
-    } else if (url.includes("spotify.com")) {
-      const searchQueries = await getSpotifyTrackUrls(url);
-      if (searchQueries.length === 0) {
-        return message.reply("Could not retrieve tracks from Spotify.");
-      }
-
-      message.reply(
-        `🔁 Loaded ${searchQueries.length} tracks from Spotify playlist.`
-      );
-
-      const [firstQuery, ...restQueries] = searchQueries;
-
-      try {
-        // Search for the first track
-        const firstResult = await yts(firstQuery);
-        const firstVideo = firstResult.videos.length
-          ? firstResult.videos[0]
-          : null;
-
-        if (!firstVideo) {
-          return message.reply("Couldn't find the first track on YouTube.");
-        }
-
-        message.reply(
-          `▶️ Now playing first track from Spotify: **${firstVideo.title}**`
-        );
-
-        // Start playback with the first song
-        playQueue([finalUrl], voiceChannel, message);
-
-        // Resolve the rest of the tracks in the background
-        (async () => {
-          const restUrls = [];
-
-          for (const query of restQueries) {
-            try {
-              const result = await yts(query);
-              const video = result.videos.length ? result.videos[0] : null;
-              if (video) {
-                restUrls.push(video.url);
-              }
-            } catch (e) {
-              console.warn("Error searching YouTube for:", query, e);
-            }
-          }
-
-          // Add results to the queue if the guild still has one
-          if (!queues.has(message.guild.id)) {
-            queues.set(message.guild.id, []);
-          }
-
-          const currentQueue = queues.get(message.guild.id);
-          currentQueue.push(...restUrls);
-        })();
-      } catch (error) {
-        console.error("Error handling Spotify playback:", error);
-        return message.reply(
-          "An error occurred while processing the Spotify playlist."
-        );
-      }
-      //
-    } else if (url.startsWith("http://") || url.startsWith("https://")) {
-      // Direct radio stream
-      if (!voiceChannel) {
-        return message.reply("Join a voice channel first!");
-      }
-
-      const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
-
-      try {
-        const resource = createAudioResource(url, { inlineVolume: true });
-        resource.volume.setVolume(0.1);
-
-        const player = createAudioPlayer();
-        player.play(resource);
-        connection.subscribe(player);
-
-        connections.set(message.guild.id, { connection, player });
-
-        message.reply(`Now playing radio stream: ${url}`);
-
-        player.on("error", (error) => {
-          console.error("Audio player error:", error);
-          message.channel.send("An error occurred while playing the audio.");
-        });
-
-        player.on("idle", () => {
-          connection.destroy();
-          connections.delete(message.guild.id);
-        });
-      } catch (error) {
-        console.error("Error playing radio stream:", error);
-        message.reply("Failed to play the provided radio stream URL.");
-      }
-    } else {
-      return message.reply(
-        "Only YouTube, Spotify and direct radio stream URLs are supported."
-      );
-    }
+  try {
+    existing.player?.stop(true);
+  } catch (err) {
+    console.warn("Failed to stop player:", err.message);
   }
 
-  if (message.content.startsWith("!search")) {
-    const args = message.content.split(" ").slice(1);
-    if (!args.length) {
-      return message.reply(
-        "Please provide a search term (e.g., `!search rock`)."
+  try {
+    existing.connection?.destroy();
+  } catch (err) {
+    console.warn("Failed to destroy connection:", err.message);
+  }
+
+  activePlayers.delete(guildId);
+  console.log(`Disconnected from guild ${guildId}`);
+}
+
+function setupPlayerDebug(player, connection, guildId) {
+  player.on("stateChange", (oldState, newState) => {
+    console.log(
+      `[Guild ${guildId}] Player: ${oldState.status} -> ${newState.status}`
+    );
+  });
+
+  connection.on("stateChange", (oldState, newState) => {
+    console.log(
+      `[Guild ${guildId}] Connection: ${oldState.status} -> ${newState.status}`
+    );
+  });
+
+  player.on("error", (error) => {
+    console.error(`[Guild ${guildId}] Player error:`, error);
+  });
+
+  connection.on("error", (error) => {
+    console.error(`[Guild ${guildId}] Connection error:`, error);
+  });
+}
+
+// =========================
+// PLAY RADIO STATION
+// =========================
+async function playRadioStation(message, voiceChannel, station) {
+  const guildId = message.guild.id;
+
+  try {
+    const existingConnection = getVoiceConnection(guildId);
+    if (existingConnection) {
+      try {
+        existingConnection.destroy();
+      } catch (e) {
+        console.warn("Failed to destroy existing connection:", e.message);
+      }
+    }
+
+  const connection = joinVoiceChannel({
+  channelId: voiceChannel.id,
+  guildId: message.guild.id,
+  adapterCreator: message.guild.voiceAdapterCreator,
+  selfDeaf: true,
+});
+
+    connection.on("debug", (msg) => {
+      console.log(`[VOICE DEBUG ${guildId}] ${msg}`);
+    });
+
+  connection.on("stateChange", (oldState, newState) => {
+  console.log(`VOICE: ${oldState.status} -> ${newState.status}`);
+});
+
+connection.on("debug", console.log);
+connection.on("error", console.error);
+
+await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+    });
+
+    player.on("stateChange", (oldState, newState) => {
+      console.log(
+        `[PLAYER STATE ${guildId}] ${oldState.status} -> ${newState.status}`
       );
+    });
+
+    player.on("error", async (error) => {
+      console.error(`[PLAYER ERROR ${guildId}]`, error);
+      await message.channel.send(
+        `⚠️ Kunde inte spela stationen **${station.name}**`
+      );
+    });
+
+    const resource = createAudioResource(station.url, {
+      inlineVolume: true,
+    });
+
+    if (resource.volume) {
+      resource.volume.setVolume(0.2);
+    }
+
+    connection.subscribe(player);
+    player.play(resource);
+
+    activePlayers.set(guildId, { connection, player });
+
+    player.once(AudioPlayerStatus.Playing, () => {
+      message.channel.send(`▶️ Now playing: **${station.name}**`);
+    });
+  } catch (error) {
+    console.error("Failed to join/play radio station:", error);
+    return message.reply("Något gick fel när boten skulle ansluta till voice.");
+  }
+}
+
+// =========================
+// AUTO LEAVE IF EMPTY
+// =========================
+function checkVoiceChannelActivity(guildId) {
+  const current = activePlayers.get(guildId);
+  if (!current) return;
+
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) return;
+
+  const channelId = current.connection.joinConfig.channelId;
+  const channel = guild.channels.cache.get(channelId);
+
+  if (!channel) return;
+
+  if (channel.members.size === 1) {
+    setTimeout(() => {
+      const updated = guild.channels.cache.get(channelId);
+      if (updated && updated.members.size === 1) {
+        console.log(`Leaving ${guildId} due to inactivity.`);
+        stopPlayback(guildId);
+      }
+    }, 2 * 60 * 1000);
+  }
+}
+
+// =========================
+// MESSAGE HANDLER
+// =========================
+client.on("messageCreate", async (message) => {
+  if (message.author.bot || !message.guild) return;
+
+  const voiceChannel = message.member?.voice?.channel;
+  const guildId = message.guild.id;
+  const content = message.content.trim();
+
+  // !search
+  if (content.startsWith("!search")) {
+    const args = content.split(" ").slice(1);
+
+    if (!args.length) {
+      return message.reply("Skriv något att söka på, t.ex. `!search rock`.");
     }
 
     const searchTerm = args.join(" ");
     const stations = await fetchRadioStations(searchTerm);
 
-    if (!stations) {
-      return message.reply("No stations found for your search.");
+    if (!stations || stations.length === 0) {
+      return message.reply("Hittade inga stationer.");
     }
 
-    let response = "Here are some matching stations:\n";
-    stations.forEach((s, i) => {
-      response += `**${i + 1}.** ${s.name}\n`;
-    });
-    response += "\nType `!play [number]` to play a station.";
+    searchResults.set(guildId, stations);
 
-    message.reply(response);
-    connections.set(message.guild.id, { stations });
+    let response = `Här är några träffar för **${searchTerm}**:\n\n`;
+    stations.forEach((station, index) => {
+      response += `**${index + 1}.** ${station.name}\n`;
+    });
+    response += `\nSkriv \`!play [nummer]\` för att spela en station.`;
+
+    return message.reply(response);
   }
 
-  if (message.content.startsWith("!play")) {
+  // !play
+  if (content.startsWith("!play")) {
     if (!voiceChannel) {
-      return message.reply(
-        "You need to be in a voice channel to use this command!"
-      );
+      return message.reply("Du måste vara i en voice channel först.");
     }
 
-    const args = message.content.split(" ")[1];
-    const guildData = connections.get(message.guild.id);
-    if (!guildData || !guildData.stations || !args) {
-      return message.reply(
-        "Please search for a station first using `!search`."
-      );
+    const arg = content.split(" ")[1];
+    if (!arg) {
+      return message.reply("Skriv t.ex. `!play 1`.");
     }
 
-    const stationIndex = parseInt(args, 10) - 1;
+    const stationIndex = parseInt(arg, 10) - 1;
+    const stations = searchResults.get(guildId);
+
+    if (!stations || !stations.length) {
+      return message.reply("Sök efter en station först med `!search`.");
+    }
+
     if (
-      isNaN(stationIndex) ||
+      Number.isNaN(stationIndex) ||
       stationIndex < 0 ||
-      stationIndex >= guildData.stations.length
+      stationIndex >= stations.length
     ) {
-      return message.reply(
-        "Invalid selection. Use a number from the search results."
-      );
+      return message.reply("Ogiltigt nummer från sökresultatet.");
     }
 
-    const station = guildData.stations[stationIndex];
+    const station = stations[stationIndex];
 
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-    });
-
-    const player = createAudioPlayer();
-    const resource = createAudioResource(station.url, { inlineVolume: true });
-    resource.volume.setVolume(0.1);
-
-    player.play(resource);
-    connection.subscribe(player);
-
-    connections.set(message.guild.id, { connection, player });
-    message.reply(`Now playing: **${station.name}** 🎵`);
-
-    checkVoiceChannelActivity(message.guild.id);
+    await playRadioStation(message, voiceChannel, station);
+    checkVoiceChannelActivity(guildId);
+    return;
   }
 
-  if (message.content === "!stop") {
-    const guildConnection = connections.get(message.guild.id);
-    if (guildConnection) {
-      guildConnection.player.stop();
-      guildConnection.connection.destroy();
-      connections.delete(message.guild.id);
-      message.reply("Stopped playing and left the voice channel.");
-    } else {
-      message.reply("Nothing is currently playing.");
-    }
-  }
-
-  if (message.content === "!skip") {
-    const guildId = message.guild.id;
-    const connectionData = connections.get(guildId);
-
-    if (!connectionData) {
-      return message.reply("There is no song playing right now.");
+  // !stop
+  if (content === "!stop") {
+    if (!activePlayers.has(guildId)) {
+      return message.reply("Inget spelas just nu.");
     }
 
-    const { player, connection } = connectionData;
-
-    if (!player) {
-      return message.reply("No audio is currently playing.");
-    }
-
-    message.reply("⏭ Skipping current track...");
-    player.stop(); // This triggers the 'idle' event, which plays the next track if any.
+    stopPlayback(guildId);
+    return message.reply("Stoppade uppspelningen och lämnade voice channel.");
   }
 });
 
-// Handle voice state updates (detect when users leave)
+// =========================
+// LEAVE WHEN USERS LEAVE
+// =========================
 client.on("voiceStateUpdate", (oldState, newState) => {
   const guildId = oldState.guild.id;
-  const guildConnection = connections.get(guildId);
+  const active = activePlayers.get(guildId);
 
-  if (!guildConnection) return; // Bot is not in a channel for this guild
+  if (!active) return;
 
-  const { connection } = guildConnection;
-  const channel = connection.joinConfig.channelId;
-  const voiceChannel = oldState.guild.channels.cache.get(channel);
+  const channelId = active.connection.joinConfig.channelId;
+  const voiceChannel = oldState.guild.channels.cache.get(channelId);
 
   if (!voiceChannel) return;
 
-  // Check if the bot is the only one left
+  // bara botten kvar
   if (voiceChannel.members.size === 1) {
     console.log(`No users left in ${voiceChannel.name}, leaving...`);
     stopPlayback(guildId);
@@ -481,104 +325,3 @@ client.on("voiceStateUpdate", (oldState, newState) => {
 });
 
 client.login(TOKEN);
-
-function stopPlayback(guildId) {
-  const guildConnection = connections.get(guildId);
-  if (guildConnection) {
-    guildConnection.player.stop();
-    guildConnection.connection.destroy();
-    connections.delete(guildId);
-    console.log(`Disconnected from ${guildId} due to inactivity.`);
-  }
-}
-
-function checkVoiceChannelActivity(guildId) {
-  const guildConnection = connections.get(guildId);
-  if (!guildConnection) return;
-
-  const { connection } = guildConnection;
-  const voiceChannel = connection.joinConfig.channelId;
-  const guild = client.guilds.cache.get(guildId);
-  const channel = guild.channels.cache.get(voiceChannel);
-
-  if (!channel) return;
-
-  // Check if the bot is the only one in the channel
-  if (channel.members.size === 1) {
-    setTimeout(() => {
-      if (channel.members.size === 1) {
-        // Check again after timeout
-        connection.destroy();
-        connections.delete(guildId);
-        console.log(`Disconnected from ${guildId} due to inactivity.`);
-      }
-    }, 2 * 60 * 1000); // Wait 2 minutes before leaving
-  }
-}
-// Modify playQueue function to store the queue:
-async function playQueue(queue, voiceChannel, message) {
-  if (!queue.length) return;
-
-  // Store the queue for this guild
-  queues.set(message.guild.id, queue);
-
-  const url = queue.shift();
-
-  try {
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: message.guild.id,
-      adapterCreator: message.guild.voiceAdapterCreator,
-    });
-
-    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-
-    const stream = ytdl(url, {
-      filter: "audioonly",
-      quality: "highestaudio",
-      highWaterMark: 1 << 25,
-    });
-
-    const resource = createAudioResource(stream, {
-      inputType: StreamType.Arbitrary,
-      inlineVolume: true,
-    });
-
-    resource.volume.setVolume(0.1);
-
-    const player = createAudioPlayer();
-    connection.subscribe(player);
-    player.play(resource);
-
-    connections.set(message.guild.id, { connection, player });
-
-    message.channel.send(`▶️ Now playing: ${url}`);
-
-    player.on("idle", () => {
-      connection.destroy();
-      connections.delete(message.guild.id);
-      const currentQueue = queues.get(message.guild.id);
-      if (currentQueue && currentQueue.length > 0) {
-        playQueue(currentQueue, voiceChannel, message);
-      } else {
-        queues.delete(message.guild.id);
-      }
-    });
-
-    player.on("error", (error) => {
-      console.error("Audio player error:", error);
-      message.channel.send("⚠️ Error while playing a track. Skipping...");
-      connection.destroy();
-      connections.delete(message.guild.id);
-      const currentQueue = queues.get(message.guild.id);
-      if (currentQueue && currentQueue.length > 0) {
-        playQueue(currentQueue, voiceChannel, message);
-      } else {
-        queues.delete(message.guild.id);
-      }
-    });
-  } catch (error) {
-    console.error("Queue error:", error);
-    message.reply("Something went wrong while trying to play the playlist.");
-  }
-}
